@@ -1,0 +1,31 @@
+﻿<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Job Tracker (Minimal UI)</title></head>
+<body>
+  <h1>Job Tracker (Minimal)</h1>
+  <div id='auth'>
+    <h3>Register</h3>
+    <input id='regEmail' placeholder='email'>
+    <input id='regPass' placeholder='password' type='password'>
+    <button onclick='register()'>Register</button>
+    <h3>Login</h3>
+    <input id='logEmail' placeholder='email (username)'>
+    <input id='logPass' placeholder='password' type='password'>
+    <button onclick='login()'>Login</button>
+    <p id='token'></p>
+  </div>
+  <hr/>
+  <div id='jobs'>
+    <h3>Create Job</h3>
+    <input id='title' placeholder='Title'>
+    <input id='company' placeholder='Company'>
+    <input id='status' placeholder='Status (applied/interview/offer)'>
+    <input id='applied_date' placeholder='YYYY-MM-DD'>
+    <input id='link' placeholder='Link'>
+    <input id='notes' placeholder='Notes'>
+    <button onclick='createJob()'>Create</button>
+    <h3>My Jobs</h3>
+    <button onclick='loadJobs()'>Refresh</button>
+    <ul id='jobsList'></ul>
+  </div>
+  <script src='app.js'></script>
+</body></html>

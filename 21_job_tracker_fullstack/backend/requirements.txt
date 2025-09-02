@@ -1,0 +1,10 @@
+﻿fastapi
+uvicorn[pure]
+sqlmodel
+sqlalchemy>=2.0
+psycopg2-binary
+pydantic
+python-dotenv
+passlib[bcrypt]
+pyjwt
+python-multipart
