@@ -1,0 +1,357 @@
+﻿# generate_job_tracker.ps1
+$root = "21_job_tracker_fullstack"
+
+# Create folders
+New-Item -ItemType Directory -Path "$root\backend\app" -Force | Out-Null
+New-Item -ItemType Directory -Path "$root\frontend" -Force | Out-Null
+
+# README (short)
+$readme = @"
+# 21_job_tracker_fullstack — FastAPI + Postgres (Docker)
+
+Production-style Job Application Tracker.
+- FastAPI API with JWT auth
+- Postgres via Docker Compose (or SQLite locally)
+- Jobs CRUD (title, company, status, etc.)
+- Minimal HTML/JS UI for quick testing
+
+## Run with Docker
+1) Copy backend\.env.example to backend\.env and set JWT_SECRET.
+2) docker compose up --build
+API docs: http://localhost:8000/docs
+
+## Run locally (no Docker)
+1) cd backend
+2) python -m venv .venv
+3) .\.venv\Scripts\activate
+4) pip install -r requirements.txt
+5) copy .env.example .env
+6) uvicorn app.main:app --reload
+"@
+Set-Content -Path "$root\README.md" -Encoding UTF8 -Value $readme
+
+# docker-compose.yml
+Set-Content -Path "$root\docker-compose.yml" -Encoding UTF8 -Value @"
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobsdb
+      POSTGRES_USER: jobsuser
+      POSTGRES_PASSWORD: jobspass
+    ports:
+      - "5432:5432"
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobsuser -d jobsdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://jobsuser:jobspass@db:5432/jobsdb
+      JWT_SECRET: supersecret_change_me
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  dbdata:
+"@
+
+# backend files
+Set-Content -Path "$root\backend\requirements.txt" -Encoding UTF8 -Value @"
+fastapi
+uvicorn[pure]
+sqlmodel
+sqlalchemy>=2.0
+psycopg2-binary
+pydantic
+python-dotenv
+passlib[bcrypt]
+pyjwt
+python-multipart
+"@
+
+Set-Content -Path "$root\backend\.env.example" -Encoding UTF8 -Value @"
+# DATABASE_URL=postgresql+psycopg2://jobsuser:jobspass@localhost:5432/jobsdb
+JWT_SECRET=change_me_in_production
+JWT_ALGO=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+"@
+
+Set-Content -Path "$root\backend\Dockerfile" -Encoding UTF8 -Value @"
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+EXPOSE 8000
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
+"@
+
+# app package
+New-Item -ItemType File -Path "$root\backend\app\__init__.py" -Force | Out-Null
+
+Set-Content -Path "$root\backend\app\database.py" -Encoding UTF8 -Value @"
+import os
+from sqlmodel import SQLModel, create_engine, Session
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./jobs.db"
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
+
+def init_db():
+    from .models import User, Job
+    SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+"@
+
+Set-Content -Path "$root\backend\app\models.py" -Encoding UTF8 -Value @"
+from datetime import date, datetime
+from typing import Optional
+from sqlmodel import SQLModel, Field, Relationship
+
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    password_hash: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    jobs: list["Job"] = Relationship(back_populates="owner")
+
+class JobBase(SQLModel):
+    title: str
+    company: str
+    status: str = "applied"
+    applied_date: Optional[date] = None
+    link: Optional[str] = None
+    notes: Optional[str] = None
+
+class Job(JobBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    owner: Optional[User] = Relationship(back_populates="jobs")
+"@
+
+Set-Content -Path "$root\backend\app\schemas.py" -Encoding UTF8 -Value @"
+from datetime import date
+from typing import Optional
+from pydantic import BaseModel, EmailStr
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class JobCreate(BaseModel):
+    title: str
+    company: str
+    status: str = "applied"
+    applied_date: Optional[date] = None
+    link: Optional[str] = None
+    notes: Optional[str] = None
+
+class JobRead(JobCreate):
+    id: int
+"@
+
+Set-Content -Path "$root\backend\app\auth.py" -Encoding UTF8 -Value @"
+import os, time, jwt
+from passlib.context import CryptContext
+from fastapi import HTTPException, status, Depends
+from fastapi.security import OAuth2PasswordBearer
+from sqlmodel import Session, select
+from .models import User
+from .database import get_session
+
+pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+JWT_SECRET = os.getenv("JWT_SECRET", "devsecret")
+JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+def hash_password(p: str) -> str:
+    return pwd.hash(p)
+
+def verify_password(p: str, h: str) -> bool:
+    return pwd.verify(p, h)
+
+def create_access_token(sub: str) -> str:
+    payload = {"sub": sub, "exp": int(time.time()) + 60*ACCESS_TOKEN_EXPIRE_MINUTES, "iat": int(time.time())}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def decode_token(token: str):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload.get("sub")
+    except jwt.PyJWTError:
+        return None
+
+def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)):
+    email = decode_token(token)
+    if not email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    user = session.exec(select(User).where(User.email == email)).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user
+"@
+
+Set-Content -Path "$root\backend\app\main.py" -Encoding UTF8 -Value @"
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlmodel import Session, select
+from .database import init_db, get_session
+from .models import User, Job
+from .schemas import UserCreate, Token, JobCreate, JobRead
+from .auth import hash_password, verify_password, create_access_token, get_current_user
+
+app = FastAPI(title="Job Tracker API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/api/auth/register", response_model=Token)
+def register(data: UserCreate, session: Session = Depends(get_session)):
+    existing = session.exec(select(User).where(User.email == data.email)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = User(email=data.email, password_hash=hash_password(data.password))
+    session.add(user); session.commit()
+    token = create_access_token(sub=user.email)
+    return Token(access_token=token)
+
+@app.post("/api/auth/login", response_model=Token)
+def login(form: OAuth2PasswordRequestForm = Depends(), session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.email == form.username)).first()
+    if not user or not verify_password(form.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    token = create_access_token(sub=user.email)
+    return Token(access_token=token)
+
+@app.post("/api/jobs", response_model=JobRead)
+def create_job(job: JobCreate, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    obj = Job(**job.dict(), owner_id=user.id)
+    session.add(obj); session.commit(); session.refresh(obj)
+    return JobRead(id=obj.id, **job.dict())
+
+@app.get("/api/jobs", response_model=list[JobRead])
+def list_jobs(session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    items = session.exec(select(Job).where(Job.owner_id == user.id).order_by(Job.created_at.desc())).all()
+    return [JobRead(id=i.id, title=i.title, company=i.company, status=i.status, applied_date=i.applied_date, link=i.link, notes=i.notes) for i in items]
+
+@app.put("/api/jobs/{job_id}", response_model=JobRead)
+def update_job(job_id: int, job: JobCreate, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    obj = session.get(Job, job_id)
+    if not obj or obj.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    for k, v in job.dict().items():
+        setattr(obj, k, v)
+    session.add(obj); session.commit(); session.refresh(obj)
+    return JobRead(id=obj.id, title=obj.title, company=obj.company, status=obj.status, applied_date=obj.applied_date, link=obj.link, notes=obj.notes)
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: int, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    obj = session.get(Job, job_id)
+    if not obj or obj.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    session.delete(obj); session.commit()
+    return {"deleted": True, "id": job_id}
+"@
+
+# frontend
+Set-Content -Path "$root\frontend\index.html" -Encoding UTF8 -Value @"
+<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Job Tracker (Minimal UI)</title></head>
+<body>
+  <h1>Job Tracker (Minimal)</h1>
+  <div id='auth'>
+    <h3>Register</h3>
+    <input id='regEmail' placeholder='email'>
+    <input id='regPass' placeholder='password' type='password'>
+    <button onclick='register()'>Register</button>
+    <h3>Login</h3>
+    <input id='logEmail' placeholder='email (username)'>
+    <input id='logPass' placeholder='password' type='password'>
+    <button onclick='login()'>Login</button>
+    <p id='token'></p>
+  </div>
+  <hr/>
+  <div id='jobs'>
+    <h3>Create Job</h3>
+    <input id='title' placeholder='Title'>
+    <input id='company' placeholder='Company'>
+    <input id='status' placeholder='Status (applied/interview/offer)'>
+    <input id='applied_date' placeholder='YYYY-MM-DD'>
+    <input id='link' placeholder='Link'>
+    <input id='notes' placeholder='Notes'>
+    <button onclick='createJob()'>Create</button>
+    <h3>My Jobs</h3>
+    <button onclick='loadJobs()'>Refresh</button>
+    <ul id='jobsList'></ul>
+  </div>
+  <script src='app.js'></script>
+</body></html>
+"@
+
+Set-Content -Path "$root\frontend\app.js" -Encoding UTF8 -Value @"
+let token = "";
+async function register() {
+  const email = document.getElementById('regEmail').value;
+  const password = document.getElementById('regPass').value;
+  const res = await fetch('http://localhost:8000/api/auth/register', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, password})});
+  const data = await res.json(); token = data.access_token || ''; document.getElementById('token').innerText = token ? 'Token ✔️' : JSON.stringify(data);
+}
+async function login() {
+  const email = document.getElementById('logEmail').value; const password = document.getElementById('logPass').value;
+  const form = new URLSearchParams(); form.append('username', email); form.append('password', password);
+  const res = await fetch('http://localhost:8000/api/auth/login', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form});
+  const data = await res.json(); token = data.access_token || ''; document.getElementById('token').innerText = token ? 'Token ✔️' : JSON.stringify(data);
+}
+async function createJob() {
+  if (!token) return alert('Login first');
+  const payload = {title:document.getElementById('title').value, company:document.getElementById('company').value, status:document.getElementById('status').value||'applied', applied_date:document.getElementById('applied_date').value||null, link:document.getElementById('link').value||null, notes:document.getElementById('notes').value||null};
+  await fetch('http://localhost:8000/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token}, body:JSON.stringify(payload)});
+  loadJobs();
+}
+async function loadJobs() {
+  if (!token) return alert('Login first');
+  const res = await fetch('http://localhost:8000/api/jobs', {headers:{'Authorization':'Bearer '+token}});
+  const items = await res.json(); const ul = document.getElementById('jobsList'); ul.innerHTML=''; items.forEach(j=>{const li=document.createElement('li'); li.innerText=`${j.id}: ${j.title} @ ${j.company} [${j.status}]`; ul.appendChild(li);});
+}
+"@
+
+Write-Host "✅ Generated $root"
